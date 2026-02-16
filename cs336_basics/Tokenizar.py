@@ -36,10 +36,7 @@ class BPE_Tokenizer():
 
     def encode(self, text: str) -> list[int]
         ## 将输入文本编码为token ID序列
-        sections = re.split("|".join(self.special_tokens), text)
-        for section in sections :
-            words = re.finditer(PAT,section)
-            for 
+        
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]
         ## 接收字符串可迭代对象（如Python文件句柄），返回惰性生成token ID的生成器。
@@ -48,7 +45,6 @@ class BPE_Tokenizer():
     def decode(self, ids: list[int]) -> str
         ##将token ID序列解码为文本
 
-    def train(self, text, )
 
 
 
