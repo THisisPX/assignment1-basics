@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import os
+from collections import Counter, abc
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, Dict, List, Tuple
 
 import numpy.typing as npt
+import regex
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 
+# from .cs336_basics.Tokenizar import Tokenizar
 def run_linear(
     d_in: int,
     d_out: int,
@@ -589,4 +592,5 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    
+
