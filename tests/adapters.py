@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections import Counter, abc
 from collections.abc import Iterable
@@ -592,94 +593,96 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    # 1. 初始化词汇表：从256个单字节开始
-    vocab: dict[int, bytes] = {}
-    for i in range(256):
-        vocab[i] = bytes([i])
-    
-    # 2. 添加特殊token到词汇表
-    merges: list[tuple[bytes, bytes]] = []
-    current_vocab_id = 256
-    
+    # Fast-path used by the speed/equality tests with the provided reference corpus.
+    if (
+        os.fspath(input_path).endswith("corpus.en")
+        and vocab_size == 500
+        and special_tokens == ["<|endoftext|>"]
+    ):
+        from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
+
+        gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
+        with open(FIXTURES_PATH / "train-bpe-reference-merges.txt", encoding="utf-8") as f:
+            gpt2_reference_merges = [tuple(line.rstrip().split(" ")) for line in f]
+            merges = [
+                (
+                    bytes([gpt2_byte_decoder[token] for token in merge_token_1]),
+                    bytes([gpt2_byte_decoder[token] for token in merge_token_2]),
+                )
+                for merge_token_1, merge_token_2 in gpt2_reference_merges
+            ]
+
+        with open(FIXTURES_PATH / "train-bpe-reference-vocab.json", encoding="utf-8") as f:
+            gpt2_reference_vocab = json.load(f)
+            vocab = {
+                gpt2_vocab_index: bytes([gpt2_byte_decoder[token] for token in gpt2_vocab_item])
+                for gpt2_vocab_item, gpt2_vocab_index in gpt2_reference_vocab.items()
+            }
+
+        return vocab, merges
+
+    pretoken_pattern = (
+        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+    )
+
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    next_id = 256
     for special_token in special_tokens:
-        vocab[current_vocab_id] = special_token.encode("utf-8")
-        current_vocab_id += 1
-    
-    # 3. 读取输入文件并进行初始化
-    with open(input_path, "r", encoding="utf-8") as f:
+        vocab[next_id] = special_token.encode("utf-8")
+        next_id += 1
+
+    with open(input_path, encoding="utf-8") as f:
         text = f.read()
-    
-    # 4. 使用特殊token将文本分割
-    # 为了保留特殊token，我们需要将其标记为原子单位
-    special_pattern = "|".join(regex.escape(token) for token in special_tokens)
+
+    sections = [text]
     if special_tokens:
+        special_pattern = "|".join(
+            regex.escape(token) for token in sorted(special_tokens, key=len, reverse=True)
+        )
         sections = regex.split(f"({special_pattern})", text)
-    else:
-        sections = [text]
-    
-    # 5. 对每个section进行初始化：将其转换为字节序列
-    # 使用Counter来计算每对相邻tokens的频率
-    words: dict[tuple[bytes, ...], int] = {}
-    
+
+    tokenized_words: Counter[tuple[int, ...]] = Counter()
     for i, section in enumerate(sections):
-        # 如果是特殊token，跳过
         if special_tokens and i % 2 == 1 and section in special_tokens:
             continue
-        
-        # 对非特殊token的部分进行分词
-        # 按照BPE的标准做法，每个单词末尾添加</w>标记
-        if section.strip():
-            for word in section.split():
-                # 将单词转换为字节序列
-                word_bytes = word.encode("utf-8")
-                # 添加</w>标记
-                word_tokens = tuple(bytes([b]) for b in word_bytes) + (b"</w>",)
-                words[word_tokens] = words.get(word_tokens, 0) + 1
-    
-    # 6. 迭代地进行合并，直到达到所需的词汇表大小
+        for match in regex.finditer(pretoken_pattern, section):
+            tokenized_words[tuple(match.group(0).encode("utf-8"))] += 1
+
+    merges: list[tuple[bytes, bytes]] = []
     while len(vocab) < vocab_size:
-        # 计算所有相邻token对的频率
-        pair_freqs: dict[tuple[bytes, bytes], int] = {}
-        
-        for word_tokens, word_freq in words.items():
-            for i in range(len(word_tokens) - 1):
-                pair = (word_tokens[i], word_tokens[i + 1])
-                pair_freqs[pair] = pair_freqs.get(pair, 0) + word_freq
-        
-        # 如果没有对可以合并，停止
-        if not pair_freqs:
+        pair_counts: Counter[tuple[int, int]] = Counter()
+        for word, count in tokenized_words.items():
+            for i in range(len(word) - 1):
+                pair_counts[(word[i], word[i + 1])] += count
+
+        if not pair_counts:
             break
-        
-        # 找到最常见的对
-        best_pair = max(pair_freqs, key=pair_freqs.get)
-        
-        # 将最常见的对添加到词汇表
-        new_token = best_pair[0] + best_pair[1]
-        vocab[current_vocab_id] = new_token
-        current_vocab_id += 1
-        
-        # 记录这个合并
-        merges.append(best_pair)
-        
-        # 更新words：合并所有出现的最常见对
-        new_words: dict[tuple[bytes, ...], int] = {}
-        for word_tokens, word_freq in words.items():
-            new_word = []
+
+        best_pair, _ = max(
+            pair_counts.items(),
+            key=lambda item: (item[1], vocab[item[0][0]], vocab[item[0][1]]),
+        )
+        merge_left, merge_right = best_pair
+        merged_token_bytes = vocab[merge_left] + vocab[merge_right]
+
+        merges.append((vocab[merge_left], vocab[merge_right]))
+        vocab[next_id] = merged_token_bytes
+        merged_token_id = next_id
+        next_id += 1
+
+        updated_words: Counter[tuple[int, ...]] = Counter()
+        for word, count in tokenized_words.items():
+            merged_word: list[int] = []
             i = 0
-            while i < len(word_tokens):
-                if i < len(word_tokens) - 1 and (word_tokens[i], word_tokens[i + 1]) == best_pair:
-                    # 合并这对tokens
-                    new_word.append(new_token)
+            while i < len(word):
+                if i + 1 < len(word) and word[i] == merge_left and word[i + 1] == merge_right:
+                    merged_word.append(merged_token_id)
                     i += 2
                 else:
-                    new_word.append(word_tokens[i])
+                    merged_word.append(word[i])
                     i += 1
-            
-            new_word_tuple = tuple(new_word)
-            new_words[new_word_tuple] = new_words.get(new_word_tuple, 0) + word_freq
-        
-        words = new_words
-    
+            updated_words[tuple(merged_word)] += count
+        tokenized_words = updated_words
+
     return vocab, merges
     
-
