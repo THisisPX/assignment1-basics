@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-from collections import Counter, abc
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO, Dict, List, Tuple
+from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
-import regex
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -623,68 +621,12 @@ def run_train_bpe(
 
         return vocab, merges
 
-    pretoken_pattern = (
-        r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+    from cs336_basics.train_bpe import run_train_bpe as _run_train_bpe
+
+    return _run_train_bpe(
+        input_path=input_path,
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+        **kwargs,
     )
-
-    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-    next_id = 256
-    for special_token in special_tokens:
-        vocab[next_id] = special_token.encode("utf-8")
-        next_id += 1
-
-    with open(input_path, encoding="utf-8") as f:
-        text = f.read()
-
-    sections = [text]
-    if special_tokens:
-        special_pattern = "|".join(
-            regex.escape(token) for token in sorted(special_tokens, key=len, reverse=True)
-        )
-        sections = regex.split(f"({special_pattern})", text)
-
-    tokenized_words: Counter[tuple[int, ...]] = Counter()
-    for i, section in enumerate(sections):
-        if special_tokens and i % 2 == 1 and section in special_tokens:
-            continue
-        for match in regex.finditer(pretoken_pattern, section):
-            tokenized_words[tuple(match.group(0).encode("utf-8"))] += 1
-
-    merges: list[tuple[bytes, bytes]] = []
-    while len(vocab) < vocab_size:
-        pair_counts: Counter[tuple[int, int]] = Counter()
-        for word, count in tokenized_words.items():
-            for i in range(len(word) - 1):
-                pair_counts[(word[i], word[i + 1])] += count
-
-        if not pair_counts:
-            break
-
-        best_pair, _ = max(
-            pair_counts.items(),
-            key=lambda item: (item[1], vocab[item[0][0]], vocab[item[0][1]]),
-        )
-        merge_left, merge_right = best_pair
-        merged_token_bytes = vocab[merge_left] + vocab[merge_right]
-
-        merges.append((vocab[merge_left], vocab[merge_right]))
-        vocab[next_id] = merged_token_bytes
-        merged_token_id = next_id
-        next_id += 1
-
-        updated_words: Counter[tuple[int, ...]] = Counter()
-        for word, count in tokenized_words.items():
-            merged_word: list[int] = []
-            i = 0
-            while i < len(word):
-                if i + 1 < len(word) and word[i] == merge_left and word[i + 1] == merge_right:
-                    merged_word.append(merged_token_id)
-                    i += 2
-                else:
-                    merged_word.append(word[i])
-                    i += 1
-            updated_words[tuple(merged_word)] += count
-        tokenized_words = updated_words
-
-    return vocab, merges
     
