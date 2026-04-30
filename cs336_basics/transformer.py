@@ -63,3 +63,34 @@ class RMSnorm(torch.nn.Module):
         """
         rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
         return x  * self.g / rms
+
+
+
+class FFN(torch.nn.Module):
+    def __init__(self, d_model, ratio = 8/3, device=None, dtype=None):
+        """初始化前馈神经网络模块。
+        参数:
+            d_model (int): 模型的隐藏层维度
+            ratio (float): 扩展因子，默认约为 8/3
+            device (torch.device | None): 参数存储设备，默认为None
+            dtype (torch.dtype | None): 参数数据类型，默认为None
+        """
+        super().__init__()
+        self.d_ff = int(math.ceil(d_model * ratio / 64) * 64)
+        self.w1 = nn.Parameter(torch.empty((self.d_ff, d_model), device=device, dtype=dtype))
+        self.w2 = nn.Parameter(torch.empty((d_model, self.d_ff), device=device, dtype=dtype))
+        self.w3 = nn.Parameter(torch.empty((self.d_ff, d_model), device=device, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        对输入张量进行前馈神经网络变换
+        参数:
+            x (torch.Tensor): 输入张量，形状为(batch_size, sequence_length, d_model)
+        """
+        GLU = lambda x : einsum(x, torch.sigmoid(x),"... d_ff, ... d_ff -> ... d_ff")
+        W1x = einsum(x, self.w1, "... d_model, d_ff d_model -> ... d_ff")
+        W3x = einsum(x, self.w3, "... d_model, d_ff d_model -> ... d_ff")
+        FFN3 = GLU(W1x) * W3x
+
+
+        return  einsum(FFN3, self.w2, "... d_ff, d_model d_ff -> ... d_model")
