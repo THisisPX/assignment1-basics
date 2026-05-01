@@ -4,12 +4,12 @@ import json
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
-
+from einops import einsum
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from cs336_basics.transformer import Linear, RMSnorm, Embedding
+from cs336_basics.transformer import Linear, RMSnorm, Embedding, FFN, RotaryPositionalEmbedding, softmax_stable
 
 # from .cs336_basics.Tokenizar import Tokenizar
 def run_linear(
@@ -80,14 +80,9 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    ffn = FFN(d_model, d_ff)
+    ffn.load_state_dict({"w1": w1_weight, "w2": w2_weight, "w3": w3_weight})
+    return ffn(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -108,7 +103,13 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    # raise NotImplementedError
+    d_k = Q.shape[-1]
+    scores = einsum(Q, K,"... queries d_k, ... keys d_k -> ... queries keys") / d_k**0.5
+    masked_scores = scores.masked_fill(mask==False,float("-inf"))
+    softmax_out =  softmax_stable(masked_scores, dim=-1)
+    attention = einsum(softmax_out, V, "... queries keys, ... keys d_v -> ... queries d_v")
+    return attention
 
 
 def run_multihead_self_attention(
@@ -204,7 +205,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = RotaryPositionalEmbedding(max_seq_len, d_k, theta)
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -437,7 +439,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer import softmax_stable
+    return softmax_stable(in_features, dim)
 
 
 def run_cross_entropy(
