@@ -9,7 +9,7 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from cs336_basics.transformer import Linear, RMSnorm, Embedding, FFN, RotaryPositionalEmbedding, softmax_stable
+from cs336_basics.transformer import Linear, RMSnorm, Embedding, FFN, RotaryEmbedding, softmax_stable
 
 # from .cs336_basics.Tokenizar import Tokenizar
 def run_linear(
@@ -143,7 +143,51 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from einops import rearrange
+
+    # Handle arbitrary leading dimensions
+    batch_shape = in_features.shape[:-2]  # e.g. () or (batch,)
+    seq_len = in_features.shape[-2]
+    d_in = in_features.shape[-1]
+
+    d_k = q_proj_weight.shape[0]
+    d_v = v_proj_weight.shape[0]
+
+    # Flatten batch dims for unified processing: (... , seq, d_in) -> (batch_flat, seq, d_in)
+    in_flat = in_features.reshape(-1, seq_len, d_in)
+
+    # QKV projections: (... , seq, d_in) -> (... , seq, d_model)
+    # Use original weights with 'd_out d_in' pattern to match torch.matmul semantics
+    q = einsum(in_flat, q_proj_weight, "... d_in, d_out d_in -> ... d_out")
+    k = einsum(in_flat, k_proj_weight, "... d_in, d_out d_in -> ... d_out")
+    v = einsum(in_flat, v_proj_weight, "... d_in, d_out d_in -> ... d_out")
+
+    # Reshape into heads: (... , seq, num_heads*d_head) -> (... , num_heads, seq, d_head)
+    q = rearrange(q, "... s (h d) -> ... h s d", h=num_heads)
+    k = rearrange(k, "... s (h d) -> ... h s d", h=num_heads)
+    v = rearrange(v, "... s (h d) -> ... h s d", h=num_heads)
+
+    # Scaled dot product attention
+    d_head = q.shape[-1]
+    scores = einsum(q, k, "... h q d, ... h k d -> ... h q k") / d_head**0.5
+
+    # Causal mask (no future tokens)
+    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool), diagonal=1)
+    scores = scores.masked_fill(causal_mask, float("-inf"))
+
+    attn_weights = softmax_stable(scores, dim=-1)
+    attn = einsum(attn_weights, v, "... h q k, ... h k d -> ... h q d")
+
+    # Reshape heads back: (... , num_heads, seq, d_head) -> (... , seq, num_heads*d_head)
+    attn = rearrange(attn, "... h s d -> ... s (h d)")
+
+    # Output projection: (... , seq, d_in) -> (... , seq, d_out)
+    # Use original weights with 'd_out d_in' pattern to match torch.matmul semantics
+    out = einsum(attn, o_proj_weight, "... d_in, d_out d_in -> ... d_out")
+
+    # Restore original batch shape: (batch_flat, seq, d_v) -> (...batch, seq, d_v)
+    out = out.reshape(*batch_shape, seq_len, d_v)
+    return out
 
 
 def run_multihead_self_attention_with_rope(
@@ -157,33 +201,42 @@ def run_multihead_self_attention_with_rope(
     o_proj_weight: Float[Tensor, " d_model d_v"],
     in_features: Float[Tensor, " ... sequence_length d_in"],
     token_positions: Int[Tensor, " ... sequence_length"] | None = None,
-) -> Float[Tensor, " ... sequence_length d_out"]:
-    """
-    Given the key, query, and value projection weights of a naive unbatched
-    implementation of multi-head attention, return the output of an optimized batched
-    implementation. This implementation should handle the key, query, and value projections
-    for all heads in a single matrix multiply.
-    This version of MHA should include RoPE.
-    In this case, the RoPE embedding dimension must be the head embedding dimension (d_model // num_heads).
-    See section 3.2.2 of Vaswani et al., 2017.
+) -> Float[Tensor, "... sequence_length d_out"]:
+    from cs336_basics.transformer import RotaryEmbedding, softmax_stable
+    from einops import einsum, rearrange
 
-    Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        num_heads (int): Number of heads to use in multi-headed attention.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        theta (float): RoPE parameter.
-        q_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the Q projection
-        k_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the K projection
-        v_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the V projection
-        o_proj_weight (Float[Tensor, "d_model d_v"]): Weights for the output projection
-        in_features (Float[Tensor, "... sequence_length d_in"]): Tensor to run your implementation on.
-        token_positions (Int[Tensor, " ... sequence_length"] | None): Optional tensor with the positions of the tokens
+    batch, seq, _ = in_features.shape
+    # Per-head dimension: d_model is total model dim, split into num_heads
+    d_k_per_head = d_model // num_heads
 
-    Returns:
-        Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
-        implementation with the given QKV projection weights and input features.
-    """
-    raise NotImplementedError
+    wq = q_proj_weight
+    wk = k_proj_weight
+    wv = v_proj_weight
+    wo = o_proj_weight
+
+    q = einsum(in_features, wq, "... d_in, d_out d_in -> ... d_out")
+    k = einsum(in_features, wk, "... d_in, d_out d_in -> ... d_out")
+    v = einsum(in_features, wv, "... d_in, d_out d_in -> ... d_out")
+
+    q = rearrange(q, "... s (h d) -> ... h s d", h=num_heads)
+    k = rearrange(k, "... s (h d) -> ... h s d", h=num_heads)
+    v = rearrange(v, "... s (h d) -> ... h s d", h=num_heads)
+
+    rope = RotaryEmbedding(max_seq_len, d_k_per_head, theta)
+    q = rope(q, token_positions)
+    k = rope(k, token_positions)
+
+    causal = torch.triu(torch.ones(seq, seq, device=q.device), diagonal=1).bool()
+
+    d_k = q.shape[-1]
+    scores = einsum(q, k, "... h q d, ... h k d -> ... h q k") / d_k**0.5
+    scores = scores.masked_fill(causal, float("-inf"))
+    attn_weights = softmax_stable(scores, dim=-1)
+    attn = einsum(attn_weights, v, "... h q k, ... h k d -> ... h q d")
+
+    attn = rearrange(attn, "... h s d -> ... s (h d)")
+    out = einsum(attn, wo, "... s d_in, d_out d_in -> ... s d_out")
+    return out
 
 
 def run_rope(
@@ -205,7 +258,7 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    rope = RotaryPositionalEmbedding(max_seq_len, d_k, theta)
+    rope = RotaryEmbedding(max_seq_len, d_k, theta)
     return rope(in_query_or_key, token_positions)
 
 
@@ -218,68 +271,72 @@ def run_transformer_block(
     weights: dict[str, Tensor],
     in_features: Float[Tensor, " batch sequence_length d_model"],
 ) -> Float[Tensor, " batch sequence_length d_model"]:
-    """
-    Given the weights of a pre-norm Transformer block and input features,
+    """Given the weights of a pre-norm Transformer block and input features,
     return the output of running the Transformer block on the input features.
 
     This function should use RoPE.
-    Depending on your implementation, you may simply need to pass the relevant args
-    to your TransformerBlock constructor, or you may need to initialize your own RoPE
-    class and pass that instead.
-
-    Args:
-        d_model (int): The dimensionality of the Transformer block input.
-        num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
-            evenly divisible by `num_heads`.
-        d_ff (int): Dimensionality of the feed-forward inner layer.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        theta (float): RoPE parameter.
-        weights (dict[str, Tensor]):
-            State dict of our reference implementation.
-            The keys of this dictionary are:
-            - `attn.q_proj.weight`
-                The query projections for all `num_heads` attention heads.
-                Shape is (d_model, d_model).
-                The rows are ordered by matrices of shape (num_heads, d_k),
-                so `attn.q_proj.weight == torch.cat([q_heads.0.weight, ..., q_heads.N.weight], dim=0)`.
-            - `attn.k_proj.weight`
-                The key projections for all `num_heads` attention heads.
-                Shape is (d_model, d_model).
-                The rows are ordered by matrices of shape (num_heads, d_k),
-                so `attn.k_proj.weight == torch.cat([k_heads.0.weight, ..., k_heads.N.weight], dim=0)`.
-            - `attn.v_proj.weight`
-                The value projections for all `num_heads` attention heads.
-                Shape is (d_model, d_model).
-                The rows are ordered by matrices of shape (num_heads, d_v),
-                so `attn.v_proj.weight == torch.cat([v_heads.0.weight, ..., v_heads.N.weight], dim=0)`.
-            - `attn.output_proj.weight`
-                Weight of the multi-head self-attention output projection
-                Shape is (d_model, d_model).
-            - `ln1.weight`
-                Weights of affine transform for the first RMSNorm
-                applied in the transformer block.
-                Shape is (d_model,).
-            - `ffn.w1.weight`
-                Weight of the first linear transformation in the FFN.
-                Shape is (d_model, d_ff).
-            - `ffn.w2.weight`
-                Weight of the second linear transformation in the FFN.
-                Shape is (d_ff, d_model).
-            - `ffn.w3.weight`
-                Weight of the third linear transformation in the FFN.
-                Shape is (d_model, d_ff).
-            - `ln2.weight`
-                Weights of affine transform for the second RMSNorm
-                applied in the transformer block.
-                Shape is (d_model,).
-        in_features (Float[Tensor, "batch sequence_length d_model"]):
-            Tensor to run your implementation on.
-
-    Returns:
-        Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
-        running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer import FFN, RMSnorm, RotaryEmbedding, softmax_stable
+    from einops import einsum, rearrange
+
+    batch, seq, _ = in_features.shape
+
+    # Pre-normalization
+    ln1 = RMSnorm(d_model)
+    ln1.load_state_dict({"g": weights["ln1.weight"]})
+    x_norm = ln1(in_features)
+
+    # Multi-head self-attention with RoPE
+    q_proj_weight = weights["attn.q_proj.weight"]
+    k_proj_weight = weights["attn.k_proj.weight"]
+    v_proj_weight = weights["attn.v_proj.weight"]
+    o_proj_weight = weights["attn.output_proj.weight"]
+
+    d_k_per_head = d_model // num_heads
+
+    q = einsum(x_norm, q_proj_weight, "... d_in, d_out d_in -> ... d_out")
+    k = einsum(x_norm, k_proj_weight, "... d_in, d_out d_in -> ... d_out")
+    v = einsum(x_norm, v_proj_weight, "... d_in, d_out d_in -> ... d_out")
+
+    q = rearrange(q, "... s (h d) -> ... h s d", h=num_heads)
+    k = rearrange(k, "... s (h d) -> ... h s d", h=num_heads)
+    v = rearrange(v, "... s (h d) -> ... h s d", h=num_heads)
+
+    rope = RotaryEmbedding(max_seq_len, d_k_per_head, theta)
+    token_positions = torch.arange(seq, device=in_features.device)
+    token_positions = rearrange(token_positions, 's -> 1 s')
+    q = rope(q, token_positions)
+    k = rope(k, token_positions)
+
+    causal = torch.triu(torch.ones(seq, seq, device=q.device), diagonal=1).bool()
+    d_k = q.shape[-1]
+    scores = einsum(q, k, "... h q d, ... h k d -> ... h q k") / d_k**0.5
+    scores = scores.masked_fill(causal, float("-inf"))
+    attn_w = softmax_stable(scores, dim=-1)
+    attn = einsum(attn_w, v, "... h q k, ... h k d -> ... h q d")
+    attn = rearrange(attn, "... h s d -> ... s (h d)")
+    attn_out = einsum(attn, o_proj_weight, "... s d_in, d_out d_in -> ... s d_out")
+
+    # Residual connection
+    x = in_features + attn_out
+
+    # Pre-normalization for FFN
+    ln2 = RMSnorm(d_model)
+    ln2.load_state_dict({"g": weights["ln2.weight"]})
+    x_norm = ln2(x)
+
+    # FFN (SwiGLU)
+    ffn = FFN(d_model, d_ff)
+    ffn.load_state_dict({
+        "w1": weights["ffn.w1.weight"],
+        "w2": weights["ffn.w2.weight"],
+        "w3": weights["ffn.w3.weight"],
+    })
+    ffn_out = ffn(x_norm)
+
+    # Final residual
+    out = x + ffn_out
+    return out
 
 
 def run_transformer_lm(
@@ -297,71 +354,88 @@ def run_transformer_lm(
     return the output of running a forward pass on the input indices.
 
     This function should use RoPE.
-
-    Args:
-        vocab_size (int): The number of unique items in the output vocabulary to be predicted.
-        context_length (int): The maximum number of tokens to process at once.
-        d_model (int): The dimensionality of the model embeddings and sublayer outputs.
-        num_layers (int): The number of Transformer layers to use.
-        num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
-            evenly divisible by `num_heads`.
-        d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
-        weights (dict[str, Tensor]):
-            State dict of our reference implementation. {num_layers} refers to an
-            integer between `0` and `num_layers - 1` (the layer index).
-            The keys of this dictionary are:
-            - `token_embeddings.weight`
-                Token embedding matrix. Shape is (vocab_size, d_model).
-            - `layers.{num_layers}.attn.q_proj.weight`
-                The query projections for all `num_heads` attention heads.
-                Shape is (num_heads * (d_model / num_heads), d_model).
-                The rows are ordered by matrices of shape (num_heads, d_k),
-                so `attn.q_proj.weight == torch.cat([q_heads.0.weight, ..., q_heads.N.weight], dim=0)`.
-            - `layers.{num_layers}.attn.k_proj.weight`
-                The key projections for all `num_heads` attention heads.
-                Shape is (num_heads * (d_model / num_heads), d_model).
-                The rows are ordered by matrices of shape (num_heads, d_k),
-                so `attn.k_proj.weight == torch.cat([k_heads.0.weight, ..., k_heads.N.weight], dim=0)`.
-            - `layers.{num_layers}.attn.v_proj.weight`
-                The value projections for all `num_heads` attention heads.
-                Shape is (num_heads * (d_model / num_heads), d_model).
-                The rows are ordered by matrices of shape (num_heads, d_v),
-                so `attn.v_proj.weight == torch.cat([v_heads.0.weight, ..., v_heads.N.weight], dim=0)`.
-            - `layers.{num_layers}.attn.output_proj.weight`
-                Weight of the multi-head self-attention output projection
-                Shape is ((d_model / num_heads) * num_heads, d_model).
-            - `layers.{num_layers}.ln1.weight`
-                Weights of affine transform for the first RMSNorm
-                applied in the transformer block.
-                Shape is (d_model,).
-            - `layers.{num_layers}.ffn.w1.weight`
-                Weight of the first linear transformation in the FFN.
-                Shape is (d_model, d_ff).
-            - `layers.{num_layers}.ffn.w2.weight`
-                Weight of the second linear transformation in the FFN.
-                Shape is (d_ff, d_model).
-            - `layers.{num_layers}.ffn.w3.weight`
-                Weight of the third linear transformation in the FFN.
-                Shape is (d_model, d_ff).
-            - `layers.{num_layers}.ln2.weight`
-                Weights of affine transform for the second RMSNorm
-                applied in the transformer block.
-                Shape is (d_model,).
-            - `ln_final.weight`
-                Weights of affine transform for RMSNorm applied to the output of the final transformer block.
-                Shape is (d_model, ).
-            - `lm_head.weight`
-                Weights of the language model output embedding.
-                Shape is (vocab_size, d_model).
-        in_indices (Int[Tensor, "batch_size sequence_length"]) Tensor with input indices to run the language model on. Shape is (batch_size, sequence_length), where
-            `sequence_length` is at most `context_length`.
-
-    Returns:
-        Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
-        next-word distribution for each token.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer import Embedding, FFN, RMSnorm, RotaryEmbedding, softmax_stable
+    from einops import einsum, rearrange
+
+    batch, seq = in_indices.shape
+    d_k_per_head = d_model // num_heads
+
+    # Token embeddings
+    token_emb = Embedding(vocab_size, d_model)
+    token_emb.load_state_dict({"Embedding": weights["token_embeddings.weight"]})
+    x = token_emb(in_indices)
+
+    # Process each layer
+    for layer_idx in range(num_layers):
+        prefix = f"layers.{layer_idx}."
+
+        # Pre-norm
+        ln1 = RMSnorm(d_model)
+        ln1.load_state_dict({"g": weights[f"{prefix}ln1.weight"]})
+        x_norm = ln1(x)
+
+        # QKV projections
+        q_proj = weights[f"{prefix}attn.q_proj.weight"]
+        k_proj = weights[f"{prefix}attn.k_proj.weight"]
+        v_proj = weights[f"{prefix}attn.v_proj.weight"]
+        o_proj = weights[f"{prefix}attn.output_proj.weight"]
+
+        q = einsum(x_norm, q_proj, "... d_in, d_out d_in -> ... d_out")
+        k = einsum(x_norm, k_proj, "... d_in, d_out d_in -> ... d_out")
+        v = einsum(x_norm, v_proj, "... d_in, d_out d_in -> ... d_out")
+
+        q = rearrange(q, "... s (h d) -> ... h s d", h=num_heads)
+        k = rearrange(k, "... s (h d) -> ... h s d", h=num_heads)
+        v = rearrange(v, "... s (h d) -> ... h s d", h=num_heads)
+
+        # RoPE
+        rope = RotaryEmbedding(context_length, d_k_per_head, rope_theta)
+        positions = torch.arange(seq, device=x.device)
+        positions = rearrange(positions, 's -> 1 s')
+        q = rope(q, positions)
+        k = rope(k, positions)
+
+        # Attention
+        causal = torch.triu(torch.ones(seq, seq, device=q.device), diagonal=1).bool()
+        d_k = q.shape[-1]
+        scores = einsum(q, k, "... h q d, ... h k d -> ... h q k") / d_k**0.5
+        scores = scores.masked_fill(causal, float("-inf"))
+        attn_w = softmax_stable(scores, dim=-1)
+        attn = einsum(attn_w, v, "... h q k, ... h k d -> ... h q d")
+        attn = rearrange(attn, "... h s d -> ... s (h d)")
+        attn_out = einsum(attn, o_proj, "... s d_in, d_out d_in -> ... s d_out")
+
+        # Residual
+        x = x + attn_out
+
+        # FFN with pre-norm
+        ln2 = RMSnorm(d_model)
+        ln2.load_state_dict({"g": weights[f"{prefix}ln2.weight"]})
+        x_norm = ln2(x)
+
+        ffn = FFN(d_model, d_ff)
+        ffn.load_state_dict({
+            "w1": weights[f"{prefix}ffn.w1.weight"],
+            "w2": weights[f"{prefix}ffn.w2.weight"],
+            "w3": weights[f"{prefix}ffn.w3.weight"],
+        })
+        ffn_out = ffn(x_norm)
+
+        # Residual
+        x = x + ffn_out
+
+    # Final norm
+    ln_final = RMSnorm(d_model)
+    ln_final.load_state_dict({"g": weights["ln_final.weight"]})
+    x = ln_final(x)
+
+    # LM head (tied with token embeddings)
+    lm_head = Embedding(vocab_size, d_model)
+    lm_head.load_state_dict({"Embedding": weights["lm_head.weight"]})
+    logits = einsum(x, lm_head.Embedding, "... s d, v d -> ... s v")
+
+    return logits
 
 
 def run_rmsnorm(
@@ -400,7 +474,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return in_features * torch.sigmoid(in_features)
 
 
 def run_get_batch(

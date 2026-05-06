@@ -1,10 +1,15 @@
 
+from doctest import OutputChecker
+from turtle import forward
+from numpy import ones_like
 import torch
 from  einops import einsum,rearrange
 import einx
 from torch import Tensor, nn
 import math
 from jaxtyping import Bool, Float, Int
+
+from tests.conftest import mask
 
 
 class Linear(torch.nn.Module):
@@ -101,24 +106,47 @@ class FFN(torch.nn.Module):
         return  einsum(FFN3, self.w2, "... d_ff, d_model d_ff -> ... d_model")
 
 
-class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
-        """初始化RoPE模块并创建缓冲区(如需要)
-        参数:
-            theta (float): RoPE的Θ参数值
-            d_k (int): 查询向量和键向量的维度
-            max_seq_len (int): 输入的最大序列长度
-            device (torch.device | None): 缓冲区存储设备，默认为None
-        """
+class RotaryEmbedding(nn.Module):
+    def __init__(self, context_length: int, dim: int, theta: float = 10000.0):
+        super().__init__()
+        self.register_buffer(
+            "_freq_cis_cache",
+            RotaryEmbedding._init_cache(context_length, dim, theta), persistent=False
+        )
+    
+    @staticmethod
+    def _init_cache(context_length: int, dim: int, theta: float) -> Float[Tensor, " 2 context_length half_dim"]:
+        assert dim % 2 == 0
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
-        """处理输入张量(形状为(..., seq_len, d_k))并返回相同形状的张量
-        参数:
-            x: 任意批次维度的输入张量
-            token_positions: 形状为(..., seq_len)的位置张量，指定x在序列维度的位置
-            使用token_positions参数对预计算的cos/sin张量进行切片
+        d = torch.arange(0, dim, 2) / dim
+        freqs = theta ** -d
+        t = torch.arange(context_length)
 
-        """
+        freqs = einsum(t, freqs, "t, f -> t f")
+
+        cos, sin = torch.cos(freqs), torch.sin(freqs)
+        return torch.stack((cos, sin))
+
+    def forward(self, x: Float[Tensor, " ... seq d"], pos_ids: Int[Tensor, " ... seq"]) -> Float[Tensor, " ... seq d"]:
+        x1, x2 = rearrange(x, '... (half_d xy) -> xy ... half_d', xy=2)
+
+        # Standard
+        # cos, sin = self._freq_cis_cache[:, pos_ids, :]
+
+        # einx
+        cos, sin = einx.get_at('cos_sin [pos] half_dim, ... -> cos_sin ... half_dim', self._freq_cis_cache, pos_ids)
+
+        # 2D rotation matrix applied to pairs in x
+        x1_rot = cos * x1 - sin * x2
+        x2_rot = sin * x1 + cos * x2
+        result = einx.rearrange('... x_half, ... x_half -> ... (x_half (1 + 1))', x1_rot, x2_rot).contiguous()
+        return result
+    
+    def extra_repr(self):
+        return f"context_length={self._freq_cis_cache.shape[0]}, dim/2={self._freq_cis_cache.shape[1]}"
+
+
+
 
 def softmax_stable(in_tensor: Tensor, dim: int):
     max_val, _ = in_tensor.max(dim=dim, keepdim=True)
@@ -128,7 +156,7 @@ def softmax_stable(in_tensor: Tensor, dim: int):
 
 
 class multihead_self_attention(torch.nn.Module):
-    def __init__(self, d_model: int, num_heads:int ,device=None, dtype=None):
+    def __init__(self, d_model: int, num_heads:int,context_length:int=1024,device=None, dtype=None):
         """
         """
         super().__init__()
@@ -136,11 +164,13 @@ class multihead_self_attention(torch.nn.Module):
         self.num_heads = num_heads
         self.d_k = d_model //  num_heads
         self.d_v = self.d_k
+        self.context_length = context_length
         self.wq = nn.Parameter(torch.empty((num_heads*self.d_k,d_model), device=device,dtype=dtype))
         self.wk = nn.Parameter(torch.empty((num_heads*self.d_k,d_model), device=device,dtype=dtype))
         self.wv = nn.Parameter(torch.empty((num_heads*self.d_v,d_model), device=device,dtype=dtype))
         self.wo = nn.Parameter(torch.empty((d_model,num_heads*self.d_v), device=device,dtype=dtype))
-    def run_scaled_dot_product_attention(
+
+    def run_scaled_dot_product_attention( self,
         Q: Float[Tensor, " ... queries d_k"],
         K: Float[Tensor, " ... keys d_k"],
         V: Float[Tensor, " ... values d_v"],
@@ -167,19 +197,54 @@ class multihead_self_attention(torch.nn.Module):
         return attention
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        """
+        """Forward pass with RoPE and causal attention."""
+        batch, seq, _ = x.shape
+
+        # QKV projections: (batch, seq, d_model) -> (batch, seq, num_heads * d_k)
         q = einsum(x, self.wq, "... d_model, d_kq d_model -> ... d_kq")
         k = einsum(x, self.wk, "... d_model, d_kk d_model -> ... d_kk")
         v = einsum(x, self.wv, "... d_model, d_kv d_model -> ... d_kv")
-        
-        q = rearrange(q,"batch, seq, num_heads * d_k -> ")
+
+        # Reshape into heads: (batch, seq, num_heads*d_k) -> (batch, num_heads, seq, d_k)
+        q = rearrange(q, "batch seq (num_heads d_k) -> batch num_heads seq d_k", num_heads=self.num_heads)
+        k = rearrange(k, "batch seq (num_heads d_k) -> batch num_heads seq d_k", num_heads=self.num_heads)
+        v = rearrange(v, "batch seq (num_heads d_v) -> batch num_heads seq d_v", num_heads=self.num_heads)
+
+        # Apply RoPE
+        rope = RotaryEmbedding(context_length=self.context_length, dim=self.d_k)
+        pos = torch.arange(seq, device=x.device)
+        pos = rearrange(pos, 's -> 1 1 s').expand(batch, self.num_heads, seq)
+        q = rope(q, pos)
+        k = rope(k, pos)
+
+        # Causal mask: upper triangle (excluding diagonal) = masked
+        causal_mask = torch.triu(torch.ones(seq, seq, device=x.device, dtype=torch.bool), diagonal=1)
+
+        # Scaled dot product attention
+        attn = self.run_scaled_dot_product_attention(q, k, v, causal_mask)
+
+        # Reshape heads back: (batch, num_heads, seq, d_v) -> (batch, seq, num_heads*d_v)
+        attn = rearrange(attn, "batch num_heads seq d_v -> batch seq (num_heads d_v)")
+
+        # Output projection
+        out = einsum(attn, self.wo, "batch seq d_model, d_model d_model -> batch seq d_model")
+
+        return out
+
 
         
-
-
-
-
-
+class transformer_block(torch.nn.Module):
+    def __init__(self, d_model:int, num_heads:int,d_ff:int):
+        super().__init__()
+        self.d_model =d_model
+        self.num_heads = num_heads
+        self.d_ff =d_ff
+    def forward(self, x):
+        MHA = multihead_self_attention(d_model=self.d_model, num_heads=self.num_heads)
+        norm = RMSnorm(d_model=self.d_model)
+        y1 = x + MHA(norm(x))
+        ffn = FFN(d_model=self.d_model,d_ff=self.d_ff)
+        y2 = y1 + ffn(norm(x))
+        return y2
 
 
